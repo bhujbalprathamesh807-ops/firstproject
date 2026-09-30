@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% load static %}
+
+{% block title %}Pay ₹99 - Smart Expense Tracker{% endblock %}
+
+{% block content %}
+<div class="payment-page">
+  <div class="payment-container">
+    <div class="payment-header">
+      <div class="payment-icon">💳</div>
+      <div class="eyebrow">SMART EXPENSE TRACKER</div>
+      <h1>Pay ₹99 to Continue</h1>
+      <p>One-time ₹99 payment is required before login or account creation.</p>
+    </div>
+
+    <div class="payment-card">
+      <div class="payment-summary">
+        <div><span>Smart Expense Tracker</span><small>One-time access payment</small></div>
+        <strong>₹99</strong>
+      </div>
+      <div class="divider"></div>
+
+      {% if razorpay_configured %}
+      <div class="upi-payment-box">
+        <div class="upi-title">🔐 Secure payment</div>
+        <p>Pay ₹99 using UPI, Card, NetBanking or another method available in Razorpay Checkout.</p>
+        <button id="payBtn" class="pay-button" type="button">Pay ₹99 &amp; Continue →</button>
+        <div id="paymentStatus" class="scan-status" aria-live="polite"></div>
+      </div>
+      {% else %}
+      <div class="payment-confirm-box">
+        <h3>Payment gateway is not configured</h3>
+        <p>Add your Razorpay <b>Test Key ID</b> and <b>Test Key Secret</b> as environment variables, then restart Django.</p>
+      </div>
+      {% endif %}
+
+      <div class="divider"></div>
+      <p class="muted">Your account/login is unlocked only after the payment signature is verified by the server.</p>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+{% if razorpay_configured %}
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+<script>
+(() => {
+  const btn = document.getElementById('payBtn');
+  const status = document.getElementById('paymentStatus');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    btn.disabled = true;
+    status.textContent = 'Opening secure checkout…';
+    const options = {
+      key: "{{ razorpay_key_id|escapejs }}",
+      amount: 9900,
+      currency: "INR",
+      name: "Smart Expense Tracker",
+      description: "One-time access payment",
+      order_id: "{{ razorpay_order_id|escapejs }}",
+      theme: {color: "#6366f1"},
+      handler: function (response) {
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.action = "{% url 'payment_success' %}";
+        const csrf = document.createElement('input');
+        csrf.type = 'hidden'; csrf.name = 'csrfmiddlewaretoken'; csrf.value = '{{ csrf_token }}';
+        form.appendChild(csrf);
+        [['razorpay_order_id', response.razorpay_order_id], ['razorpay_payment_id', response.razorpay_payment_id], ['razorpay_signature', response.razorpay_signature]].forEach(([name, value]) => {
+          const input = document.createElement('input'); input.type = 'hidden'; input.name = name; input.value = value; form.appendChild(input);
+        });
+        document.body.appendChild(form);
+        form.submit();
+      },
+      modal: { ondismiss: function () { btn.disabled = false; status.textContent = 'Payment cancelled. You can try again.'; } }
+    };
+    const rzp = new Razorpay(options);
+    rzp.on('payment.failed', function (response) {
+      btn.disabled = false;
+      status.textContent = 'Payment failed. Please try again.';
+    });
+    rzp.open();
+  });
+})();
+</script>
+{% endif %}
+{% endblock %}
