@@ -1,184 +1,76 @@
-from datetime import date
-from decimal import Decimal, ROUND_HALF_UP
-import hashlib
-import hmac
-import json
 import os
-import urllib.request
+from decimal import Decimal
+
+import razorpay
 
 from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
-from django.db import IntegrityError
-from django.db.models import Sum
-from django.shortcuts import get_object_or_404, redirect, render
+from django.db import IntegrityError, connection
 from django.http import JsonResponse
-from django.utils import timezone
+from django.shortcuts import get_object_or_404, redirect, render
+from django.views.decorators.csrf import csrf_exempt
 
-from .forms import BudgetForm, EMIForm, ProfileForm, TransactionForm
 from .models import (
     Budget,
     Category,
-    ContactMessage,
     EMI,
     Payment,
     Transaction,
     UserProfile,
 )
 
+
 REGISTRATION_FEE = Decimal("99.00")
 
 
-def seed_categories(user):
-    defaults = [
-        ("Food", "🍔", "#f97316", "expense"),
-        ("Transport", "🚗", "#0ea5e9", "expense"),
-        ("Shopping", "🛍️", "#ec4899", "expense"),
-        ("Bills", "💡", "#8b5cf6", "expense"),
-        ("Health", "❤️", "#ef4444", "expense"),
-        ("Entertainment", "🎬", "#14b8a6", "expense"),
-        ("Education", "📚", "#6366f1", "expense"),
-        ("Salary", "💼", "#22c55e", "income"),
-        ("Other", "✨", "#64748b", "expense"),
-    ]
-
-    for name, icon, color, kind in defaults:
-        Category.objects.get_or_create(
-            name=name,
-            owner=user,
-            defaults={
-                "icon": icon,
-                "color": color,
-                "kind": kind,
-            },
-        )
-
-
-def health_check(request):
-    return JsonResponse({
-        "status": "ok",
-        "service": "smart-expense-tracker"
-    })
-
+# =========================================================
+# HOME
+# =========================================================
 
 def home(request):
-    if request.user.is_authenticated:
-        return redirect("dashboard")
-
-    return render(
-        request,
-        "home.html",
-        {
-            "registration_fee": REGISTRATION_FEE
-        }
-    )
+    return render(request, "home.html")
 
 
 # =========================================================
-# RAZORPAY
+# DATABASE HEALTH CHECK
 # =========================================================
 
-def _razorpay_credentials():
-    return (
-        os.getenv("RAZORPAY_KEY_ID", "").strip(),
-        os.getenv("RAZORPAY_KEY_SECRET", "").strip(),
-    )
+def health_check(request):
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+
+        return JsonResponse({
+            "status": "ok",
+            "database": "connected",
+            "database_engine": connection.vendor,
+            "service": "smart-expense-tracker",
+        })
+
+    except Exception as exc:
+        return JsonResponse({
+            "status": "error",
+            "database": "not connected",
+            "error": str(exc),
+            "service": "smart-expense-tracker",
+        }, status=500)
 
 
-def _create_razorpay_order(amount_paise, receipt):
-    key_id, key_secret = _razorpay_credentials()
+# =========================================================
+# RAZORPAY CLIENT
+# =========================================================
 
-    if not key_id or not key_secret:
-        raise RuntimeError(
-            "Razorpay keys are not configured. "
-            "Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET."
-        )
-
-    payload = json.dumps({
-        "amount": int(amount_paise),
-        "currency": "INR",
-        "receipt": receipt,
-    }).encode("utf-8")
-
-    request = urllib.request.Request(
-        "https://api.razorpay.com/v1/orders",
-        data=payload,
-        method="POST",
-        headers={
-            "Content-Type": "application/json"
-        },
-    )
-
-    import base64
-
-    auth = (
-        f"{key_id}:{key_secret}"
-    ).encode("utf-8")
-
-    request.add_header(
-        "Authorization",
-        "Basic " + base64.b64encode(auth).decode("ascii")
-    )
-
-    with urllib.request.urlopen(request, timeout=20) as response:
-        return json.loads(
-            response.read().decode("utf-8")
-        )
-
-
-def _fetch_razorpay_payment(payment_id):
-    key_id, key_secret = _razorpay_credentials()
+def get_razorpay_client():
+    key_id = os.getenv("RAZORPAY_KEY_ID", "").strip()
+    key_secret = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
 
     if not key_id or not key_secret:
         return None
 
-    request = urllib.request.Request(
-        f"https://api.razorpay.com/v1/payments/{payment_id}",
-        method="GET",
-    )
-
-    import base64
-
-    auth = (
-        f"{key_id}:{key_secret}"
-    ).encode("utf-8")
-
-    request.add_header(
-        "Authorization",
-        "Basic " + base64.b64encode(auth).decode("ascii")
-    )
-
-    with urllib.request.urlopen(request, timeout=20) as response:
-        return json.loads(
-            response.read().decode("utf-8")
-        )
-
-
-def _verify_razorpay_signature(
-    order_id,
-    payment_id,
-    signature
-):
-    _, key_secret = _razorpay_credentials()
-
-    if not key_secret:
-        return False
-
-    message = (
-        f"{order_id}|{payment_id}"
-    ).encode("utf-8")
-
-    expected = hmac.new(
-        key_secret.encode("utf-8"),
-        message,
-        hashlib.sha256,
-    ).hexdigest()
-
-    return hmac.compare_digest(
-        expected,
-        signature or ""
-    )
+    return razorpay.Client(auth=(key_id, key_secret))
 
 
 # =========================================================
@@ -186,196 +78,126 @@ def _verify_razorpay_signature(
 # =========================================================
 
 def payment(request):
-    """
-    ₹99 payment is required only for NEW ACCOUNT registration.
-
-    Existing users do NOT come here when they click Login.
-    """
-
+    # Existing logged-in user should never pay again
     if request.user.is_authenticated:
         return redirect("dashboard")
 
-    # Payment is only for registration.
-    next_page = "register"
+    client = get_razorpay_client()
 
-    request.session["payment_next"] = next_page
-
-    key_id, key_secret = _razorpay_credentials()
-
-    if not key_id or not key_secret:
-        return render(
+    if client is None:
+        messages.error(
             request,
-            "payment.html",
-            {
-                "registration_fee": REGISTRATION_FEE,
-                "razorpay_configured": False,
-            },
+            "Payment service is not configured. Please try again later."
         )
+        return redirect("home")
+
+    amount_paise = int(REGISTRATION_FEE * 100)
 
     try:
-        order = _create_razorpay_order(
-            9900,
-            f"se_access_{timezone.now().strftime('%Y%m%d%H%M%S%f')}"
-        )
+        order = client.order.create({
+            "amount": amount_paise,
+            "currency": "INR",
+            "receipt": f"expense_access_{request.session.session_key}",
+            "payment_capture": 1,
+        })
 
-        Payment.objects.create(
+        payment_obj = Payment.objects.create(
             order_id=order["id"],
             amount=REGISTRATION_FEE,
+            currency="INR",
             purpose="access",
+            status="created",
         )
+
+        request.session["pending_payment_order_id"] = order["id"]
+        request.session["payment_next"] = "register"
+
+        context = {
+            "razorpay_key_id": os.getenv("RAZORPAY_KEY_ID", "").strip(),
+            "order_id": order["id"],
+            "amount": amount_paise,
+            "amount_display": REGISTRATION_FEE,
+            "currency": "INR",
+            "payment_id": payment_obj.id,
+        }
+
+        return render(request, "payment.html", context)
 
     except Exception as exc:
         messages.error(
             request,
-            f"Could not create the payment order: {exc}"
+            f"Unable to start payment: {str(exc)}"
         )
-
-        return render(
-            request,
-            "payment.html",
-            {
-                "registration_fee": REGISTRATION_FEE,
-                "razorpay_configured": False,
-                "payment_error": str(exc),
-            },
-        )
-
-    request.session["pending_payment_order_id"] = order["id"]
-
-    return render(
-        request,
-        "payment.html",
-        {
-            "registration_fee": REGISTRATION_FEE,
-            "razorpay_configured": True,
-            "razorpay_key_id": key_id,
-            "razorpay_order_id": order["id"],
-        },
-    )
+        return redirect("home")
 
 
+# =========================================================
+# PAYMENT SUCCESS
+# =========================================================
+
+@csrf_exempt
 def payment_success(request):
     if request.method != "POST":
         return redirect("payment")
 
-    order_id = request.POST.get(
-        "razorpay_order_id",
-        ""
+    razorpay_order_id = request.POST.get(
+        "razorpay_order_id", ""
     ).strip()
 
-    payment_id = request.POST.get(
-        "razorpay_payment_id",
-        ""
+    razorpay_payment_id = request.POST.get(
+        "razorpay_payment_id", ""
     ).strip()
 
-    signature = request.POST.get(
-        "razorpay_signature",
-        ""
+    razorpay_signature = request.POST.get(
+        "razorpay_signature", ""
     ).strip()
 
-    expected_order = request.session.get(
-        "pending_payment_order_id"
-    )
+    if not razorpay_order_id or not razorpay_payment_id or not razorpay_signature:
+        messages.error(request, "Payment verification details are missing.")
+        return redirect("payment")
 
-    if (
-        not order_id
-        or order_id != expected_order
-        or not payment_id
-        or not signature
-    ):
+    client = get_razorpay_client()
+
+    if client is None:
         messages.error(
             request,
-            "Payment verification data is missing or invalid."
+            "Payment service is not configured."
         )
         return redirect("payment")
 
-    payment = get_object_or_404(
-        Payment,
-        order_id=order_id,
-        status="created"
-    )
-
-    # Verify Razorpay signature
-    if not _verify_razorpay_signature(
-        order_id,
-        payment_id,
-        signature
-    ):
-        payment.status = "failed"
-
-        payment.save(
-            update_fields=["status"]
-        )
-
-        messages.error(
-            request,
-            "Payment verification failed. No access was granted."
-        )
-
-        return redirect("payment")
-
-    # Verify payment with Razorpay
     try:
-        gateway_payment = _fetch_razorpay_payment(
-            payment_id
-        )
-    except Exception:
-        gateway_payment = None
+        client.utility.verify_payment_signature({
+            "razorpay_order_id": razorpay_order_id,
+            "razorpay_payment_id": razorpay_payment_id,
+            "razorpay_signature": razorpay_signature,
+        })
 
-    if (
-        not gateway_payment
-        or gateway_payment.get("status") != "captured"
-        or int(gateway_payment.get("amount", 0)) != 9900
-        or gateway_payment.get("currency") != "INR"
-    ):
-        payment.status = "failed"
-
-        payment.save(
-            update_fields=["status"]
+        payment_obj = get_object_or_404(
+            Payment,
+            order_id=razorpay_order_id
         )
 
+        payment_obj.payment_id = razorpay_payment_id
+        payment_obj.signature = razorpay_signature
+        payment_obj.status = "paid"
+        payment_obj.save()
+
+        request.session["payment_completed"] = True
+        request.session["pending_payment_order_id"] = razorpay_order_id
+
+        messages.success(
+            request,
+            "₹99 payment successful. You can now create your account."
+        )
+
+        return redirect("register")
+
+    except Exception as exc:
         messages.error(
             request,
-            "The gateway could not confirm the ₹99 payment. "
-            "No access was granted."
+            f"Payment verification failed: {str(exc)}"
         )
-
         return redirect("payment")
-
-    # Payment verified
-    payment.payment_id = payment_id
-    payment.signature = signature
-    payment.status = "paid"
-    payment.paid_at = timezone.now()
-
-    payment.save(
-        update_fields=[
-            "payment_id",
-            "signature",
-            "status",
-            "paid_at",
-        ]
-    )
-
-    request.session["payment_completed"] = True
-    request.session["payment_amount"] = str(
-        REGISTRATION_FEE
-    )
-
-    request.session["paid_payment_record_id"] = payment.id
-
-    request.session.pop(
-        "pending_payment_order_id",
-        None
-    )
-
-    messages.success(
-        request,
-        "₹99 payment verified successfully. "
-        "Continue to create your account."
-    )
-
-    return redirect("register")
 
 
 # =========================================================
@@ -383,23 +205,24 @@ def payment_success(request):
 # =========================================================
 
 def register(request):
+
+    # Already logged-in user does not need registration
     if request.user.is_authenticated:
         return redirect("dashboard")
 
-    # NEW ACCOUNT requires ₹99 payment
-    if not request.session.get("payment_completed"):
-        request.session["payment_next"] = "register"
+    # New account requires successful ₹99 payment
+    payment_completed = request.session.get(
+        "payment_completed",
+        False
+    )
+
+    if not payment_completed:
         return redirect("payment")
 
     if request.method == "POST":
 
         username = request.POST.get(
             "username",
-            ""
-        ).strip()
-
-        first_name = request.POST.get(
-            "first_name",
             ""
         ).strip()
 
@@ -413,71 +236,38 @@ def register(request):
             ""
         )
 
-        confirm = request.POST.get(
+        confirm_password = request.POST.get(
             "confirm_password",
             ""
         )
 
-        if (
-            not username
-            or not email
-            or not password
-            or not confirm
-        ):
+        if not username or not password:
             messages.error(
                 request,
-                "Please fill in all required fields."
+                "Username and password are required."
             )
-
             return render(
                 request,
                 "registration/register.html"
             )
 
-        if len(password) < 6:
-            messages.error(
-                request,
-                "Password must contain at least 6 characters."
-            )
-
-            return render(
-                request,
-                "registration/register.html"
-            )
-
-        if password != confirm:
+        if password != confirm_password:
             messages.error(
                 request,
                 "Passwords do not match."
             )
-
             return render(
                 request,
                 "registration/register.html"
             )
 
         if User.objects.filter(
-            username__iexact=username
+            username=username
         ).exists():
 
             messages.error(
                 request,
-                "Username already exists. "
-                "Please choose another username."
-            )
-
-            return render(
-                request,
-                "registration/register.html"
-            )
-
-        if User.objects.filter(
-            email__iexact=email
-        ).exists():
-
-            messages.error(
-                request,
-                "This email is already registered."
+                "Username already exists. Please choose another username."
             )
 
             return render(
@@ -490,65 +280,88 @@ def register(request):
                 username=username,
                 email=email,
                 password=password,
-                first_name=first_name,
             )
 
-            seed_categories(user)
-
-            UserProfile.objects.create(
-                user=user,
-                subscription_active=True
+            # Create / activate profile
+            profile_obj, _ = UserProfile.objects.get_or_create(
+                user=user
             )
 
-            paid_id = request.session.get(
-                "paid_payment_record_id"
+            profile_obj.subscription_active = True
+            profile_obj.save(
+                update_fields=["subscription_active"]
             )
 
-            if paid_id:
-                Payment.objects.filter(
-                    id=paid_id,
-                    status="paid"
-                ).update(
-                    user=user
+            # Link payment to created user
+            order_id = request.session.get(
+                "pending_payment_order_id"
+            )
+
+            if order_id:
+                paid_payment = Payment.objects.filter(
+                    order_id=order_id
+                ).first()
+
+                if paid_payment:
+                    paid_payment.user = user
+                    paid_payment.status = "paid"
+                    paid_payment.save()
+
+            # Create default categories
+            default_categories = [
+                "Food",
+                "Transport",
+                "Shopping",
+                "Bills",
+                "Entertainment",
+                "Health",
+                "Education",
+                "Salary",
+                "Other",
+            ]
+
+            for category_name in default_categories:
+                Category.objects.get_or_create(
+                    user=user,
+                    name=category_name,
                 )
 
-        except IntegrityError:
+            login(request, user)
 
+            # Clear payment session
+            request.session.pop(
+                "payment_completed",
+                None
+            )
+
+            request.session.pop(
+                "pending_payment_order_id",
+                None
+            )
+
+            request.session.pop(
+                "payment_next",
+                None
+            )
+
+            messages.success(
+                request,
+                "Account created successfully. Welcome to SmartExpense!"
+            )
+
+            return redirect("dashboard")
+
+        except IntegrityError:
             messages.error(
                 request,
-                "Could not create the account. "
-                "Please try another username."
+                "Username already exists. Please choose another username."
             )
 
-            return render(
+        except Exception as exc:
+            messages.error(
                 request,
-                "registration/register.html"
+                f"Account creation failed: {str(exc)}"
             )
-
-        login(request, user)
-
-        request.session.pop(
-            "payment_completed",
-            None
-        )
-
-        request.session.pop(
-            "payment_amount",
-            None
-        )
-
-        request.session.pop(
-            "paid_payment_record_id",
-            None
-        )
-
-        messages.success(
-            request,
-            "Account created successfully. "
-            "Welcome to SmartExpense!"
-        )
-
-        return redirect("dashboard")
 
     return render(
         request,
@@ -561,13 +374,8 @@ def register(request):
 # =========================================================
 
 def login_view(request):
-    """
-    EXISTING USER LOGIN
 
-    IMPORTANT:
-    No ₹99 payment is required here.
-    """
-
+    # Already logged in
     if request.user.is_authenticated:
         return redirect("dashboard")
 
@@ -591,25 +399,19 @@ def login_view(request):
 
         if user is not None:
 
-            # Existing user can login directly.
+            # IMPORTANT:
+            # Existing users do NOT need ₹99 payment.
             profile_obj, _ = UserProfile.objects.get_or_create(
                 user=user
             )
 
-            # Keep existing account active.
             if not profile_obj.subscription_active:
                 profile_obj.subscription_active = True
-
                 profile_obj.save(
-                    update_fields=[
-                        "subscription_active"
-                    ]
+                    update_fields=["subscription_active"]
                 )
 
-            login(
-                request,
-                user
-            )
+            login(request, user)
 
             messages.success(
                 request,
@@ -641,9 +443,15 @@ def login_view(request):
 # LOGOUT
 # =========================================================
 
+@login_required
 def logout_view(request):
-    if request.method == "POST":
-        logout(request)
+
+    logout(request)
+
+    messages.success(
+        request,
+        "You have been logged out successfully."
+    )
 
     return redirect("home")
 
@@ -654,88 +462,38 @@ def logout_view(request):
 
 @login_required
 def dashboard(request):
-    seed_categories(request.user)
 
-    today = timezone.localdate()
-    start = today.replace(day=1)
+    transactions = Transaction.objects.filter(
+        user=request.user
+    ).order_by("-date", "-id")
 
-    month_tx = Transaction.objects.filter(
-        user=request.user,
-        date__gte=start,
-        date__lte=today
+    total_income = sum(
+        transaction.amount
+        for transaction in transactions
+        if transaction.transaction_type == "income"
     )
 
-    income = (
-        month_tx
-        .filter(transaction_type="income")
-        .aggregate(v=Sum("amount"))["v"]
-        or Decimal("0")
+    total_expense = sum(
+        transaction.amount
+        for transaction in transactions
+        if transaction.transaction_type == "expense"
     )
 
-    expense = (
-        month_tx
-        .filter(transaction_type="expense")
-        .aggregate(v=Sum("amount"))["v"]
-        or Decimal("0")
-    )
+    balance = total_income - total_expense
 
-    categories = Category.objects.filter(
-        owner=request.user,
-        kind="expense"
-    )
+    recent_transactions = transactions[:5]
 
-    cat_rows = []
-
-    for category in categories:
-
-        total = (
-            month_tx
-            .filter(
-                category=category,
-                transaction_type="expense"
-            )
-            .aggregate(v=Sum("amount"))["v"]
-            or Decimal("0")
-        )
-
-        if total:
-            cat_rows.append({
-                "name": category.name,
-                "value": float(total),
-                "icon": category.icon,
-                "color": category.color,
-            })
-
-    cat_rows.sort(
-        key=lambda x: x["value"],
-        reverse=True
-    )
+    context = {
+        "transactions": recent_transactions,
+        "total_income": total_income,
+        "total_expense": total_expense,
+        "balance": balance,
+    }
 
     return render(
         request,
         "dashboard.html",
-        {
-            "income": income,
-            "expense": expense,
-            "balance": income - expense,
-            "recent": Transaction.objects.filter(
-                user=request.user
-            )[:6],
-            "cat_rows": cat_rows[:6],
-            "budget_total": (
-                Budget.objects
-                .filter(
-                    user=request.user,
-                    month=start
-                )
-                .aggregate(v=Sum("amount"))["v"]
-                or Decimal("0")
-            ),
-            "month_name": today.strftime("%B %Y"),
-            "emi_count": EMI.objects.filter(
-                user=request.user
-            ).count(),
-        }
+        context
     )
 
 
@@ -745,141 +503,91 @@ def dashboard(request):
 
 @login_required
 def transactions(request):
-    qs = Transaction.objects.filter(
+
+    transaction_list = Transaction.objects.filter(
         user=request.user
-    )
+    ).order_by("-date", "-id")
 
-    q = request.GET.get(
-        "q",
-        ""
-    ).strip()
-
-    typ = request.GET.get(
-        "type",
-        ""
-    )
-
-    category = request.GET.get(
-        "category",
-        ""
-    )
-
-    if q:
-        qs = qs.filter(
-            title__icontains=q
-        )
-
-    if typ in {
-        "income",
-        "expense"
-    }:
-        qs = qs.filter(
-            transaction_type=typ
-        )
-
-    if category.isdigit():
-        qs = qs.filter(
-            category_id=category
-        )
+    context = {
+        "transactions": transaction_list,
+    }
 
     return render(
         request,
         "transactions.html",
-        {
-            "transactions": qs.order_by(
-                "-date",
-                "-id"
-            ),
-            "categories": Category.objects.filter(
-                owner=request.user
-            ),
-            "q": q,
-            "typ": typ,
-            "category": category,
-        }
+        context
     )
 
 
 @login_required
 def add_transaction(request):
-    seed_categories(request.user)
 
-    form = TransactionForm(
-        request.POST or None,
-        request.FILES or None,
-        user=request.user
-    )
+    if request.method == "POST":
 
-    if request.method == "POST" and form.is_valid():
-
-        obj = form.save(
-            commit=False
+        amount = request.POST.get(
+            "amount",
+            "0"
         )
 
-        obj.user = request.user
-        obj.save()
+        description = request.POST.get(
+            "description",
+            ""
+        ).strip()
+
+        transaction_type = request.POST.get(
+            "transaction_type",
+            "expense"
+        )
+
+        category_id = request.POST.get(
+            "category"
+        )
+
+        date = request.POST.get(
+            "date"
+        )
+
+        category = None
+
+        if category_id:
+            category = Category.objects.filter(
+                id=category_id,
+                user=request.user
+            ).first()
+
+        Transaction.objects.create(
+            user=request.user,
+            amount=amount,
+            description=description,
+            transaction_type=transaction_type,
+            category=category,
+            date=date,
+        )
 
         messages.success(
             request,
             "Transaction added successfully."
         )
 
-        return redirect(
-            "transactions"
-        )
+        return redirect("transactions")
+
+    categories = Category.objects.filter(
+        user=request.user
+    )
 
     return render(
         request,
-        "transaction_form.html",
+        "add_transaction.html",
         {
-            "form": form,
-            "title": "Add Transaction"
+            "categories": categories,
         }
     )
 
 
 @login_required
 def edit_transaction(request, pk):
-    obj = get_object_or_404(
-        Transaction,
-        pk=pk,
-        user=request.user
-    )
 
-    form = TransactionForm(
-        request.POST or None,
-        request.FILES or None,
-        instance=obj,
-        user=request.user
-    )
-
-    if request.method == "POST" and form.is_valid():
-
-        form.save()
-
-        messages.success(
-            request,
-            "Transaction updated successfully."
-        )
-
-        return redirect(
-            "transactions"
-        )
-
-    return render(
-        request,
-        "transaction_form.html",
-        {
-            "form": form,
-            "title": "Edit Transaction",
-            "scanner": False,
-        }
-    )
-
-
-@login_required
-def delete_transaction(request, pk):
-    obj = get_object_or_404(
+    transaction = get_object_or_404(
         Transaction,
         pk=pk,
         user=request.user
@@ -887,16 +595,77 @@ def delete_transaction(request, pk):
 
     if request.method == "POST":
 
-        obj.delete()
+        transaction.amount = request.POST.get(
+            "amount",
+            transaction.amount
+        )
+
+        transaction.description = request.POST.get(
+            "description",
+            transaction.description
+        ).strip()
+
+        transaction.transaction_type = request.POST.get(
+            "transaction_type",
+            transaction.transaction_type
+        )
+
+        category_id = request.POST.get(
+            "category"
+        )
+
+        if category_id:
+            transaction.category = Category.objects.filter(
+                id=category_id,
+                user=request.user
+            ).first()
+
+        transaction.date = request.POST.get(
+            "date",
+            transaction.date
+        )
+
+        transaction.save()
+
+        messages.success(
+            request,
+            "Transaction updated successfully."
+        )
+
+        return redirect("transactions")
+
+    categories = Category.objects.filter(
+        user=request.user
+    )
+
+    return render(
+        request,
+        "edit_transaction.html",
+        {
+            "transaction": transaction,
+            "categories": categories,
+        }
+    )
+
+
+@login_required
+def delete_transaction(request, pk):
+
+    transaction = get_object_or_404(
+        Transaction,
+        pk=pk,
+        user=request.user
+    )
+
+    if request.method == "POST":
+        transaction.delete()
 
         messages.success(
             request,
             "Transaction deleted successfully."
         )
 
-    return redirect(
-        "transactions"
-    )
+    return redirect("transactions")
 
 
 # =========================================================
@@ -905,81 +674,53 @@ def delete_transaction(request, pk):
 
 @login_required
 def budgets(request):
-    month = timezone.localdate().replace(
-        day=1
-    )
 
-    form = BudgetForm(
-        request.POST or None,
-        user=request.user,
-        initial={
-            "month": month
-        }
-    )
+    budget_list = Budget.objects.filter(
+        user=request.user
+    ).order_by("-id")
 
-    if request.method == "POST" and form.is_valid():
+    if request.method == "POST":
 
-        obj = form.save(
-            commit=False
+        category_id = request.POST.get(
+            "category"
         )
 
-        obj.user = request.user
-        obj.month = month
-        obj.save()
-
-        messages.success(
-            request,
-            "Budget saved successfully."
+        amount = request.POST.get(
+            "amount"
         )
 
-        return redirect(
-            "budgets"
-        )
+        category = Category.objects.filter(
+            id=category_id,
+            user=request.user
+        ).first()
 
-    data = []
+        if category and amount:
 
-    for budget in Budget.objects.filter(
-        user=request.user,
-        month=month
-    ):
-
-        spent = (
-            Transaction.objects
-            .filter(
+            Budget.objects.update_or_create(
                 user=request.user,
-                category=budget.category,
-                transaction_type="expense",
-                date__year=month.year,
-                date__month=month.month,
+                category=category,
+                defaults={
+                    "amount": amount,
+                },
             )
-            .aggregate(v=Sum("amount"))["v"]
-            or Decimal("0")
-        )
 
-        pct = (
-            min(
-                100,
-                float(
-                    spent / budget.amount * 100
-                )
+            messages.success(
+                request,
+                "Budget saved successfully."
             )
-            if budget.amount
-            else 0
-        )
 
-        data.append({
-            "budget": budget,
-            "spent": spent,
-            "pct": pct,
-            "remaining": budget.amount - spent,
-        })
+            return redirect("budgets")
+
+    categories = Category.objects.filter(
+        user=request.user
+    )
 
     return render(
         request,
         "budgets.html",
         {
-            "items": data,
-            "form": form
+            "budgets": budget_list,
+            "categories": categories,
         }
     )
 
@@ -990,76 +731,36 @@ def budgets(request):
 
 @login_required
 def reports(request):
-    today = timezone.localdate()
 
-    rows = []
+    transaction_list = Transaction.objects.filter(
+        user=request.user
+    )
 
-    for category in Category.objects.filter(
-        owner=request.user,
-        kind="expense"
-    ):
+    total_income = sum(
+        transaction.amount
+        for transaction in transaction_list
+        if transaction.transaction_type == "income"
+    )
 
-        total = (
-            Transaction.objects
-            .filter(
-                user=request.user,
-                category=category,
-                transaction_type="expense",
-                date__year=today.year,
-            )
-            .aggregate(v=Sum("amount"))["v"]
-            or Decimal("0")
-        )
+    total_expense = sum(
+        transaction.amount
+        for transaction in transaction_list
+        if transaction.transaction_type == "expense"
+    )
 
-        if total:
-            rows.append({
-                "name": category.name,
-                "value": float(total),
-                "icon": category.icon,
-            })
+    balance = total_income - total_expense
 
-    monthly = []
-
-    for i in range(5, -1, -1):
-
-        y = (
-            today.year
-            + (today.month - i - 1) // 12
-        )
-
-        m = (
-            (today.month - i - 1) % 12
-            + 1
-        )
-
-        total = (
-            Transaction.objects
-            .filter(
-                user=request.user,
-                transaction_type="expense",
-                date__year=y,
-                date__month=m,
-            )
-            .aggregate(v=Sum("amount"))["v"]
-            or Decimal("0")
-        )
-
-        monthly.append({
-            "label": date(
-                y,
-                m,
-                1
-            ).strftime("%b"),
-            "value": float(total),
-        })
+    context = {
+        "transactions": transaction_list,
+        "total_income": total_income,
+        "total_expense": total_expense,
+        "balance": balance,
+    }
 
     return render(
         request,
         "reports.html",
-        {
-            "rows": rows,
-            "monthly": monthly,
-        }
+        context
     )
 
 
@@ -1069,178 +770,71 @@ def reports(request):
 
 @login_required
 def emi_list(request):
-    form = EMIForm(
-        request.POST or None
-    )
-
-    if request.method == "POST" and form.is_valid():
-
-        obj = form.save(
-            commit=False
-        )
-
-        obj.user = request.user
-
-        principal = Decimal(
-            obj.principal
-        )
-
-        annual = Decimal(
-            obj.annual_interest_rate
-        )
-
-        n = int(
-            obj.tenure_months
-        )
-
-        if (
-            principal <= 0
-            or n <= 0
-            or annual < 0
-        ):
-
-            form.add_error(
-                None,
-                "Enter a principal greater than 0, "
-                "a positive tenure, and a non-negative interest rate."
-            )
-
-            emis = EMI.objects.filter(
-                user=request.user
-            )
-
-            return render(
-                request,
-                "emi.html",
-                {
-                    "form": form,
-                    "emis": emis
-                }
-            )
-
-        monthly_rate = (
-            annual / Decimal("1200")
-        )
-
-        if monthly_rate == 0:
-
-            emi = (
-                principal / Decimal(n)
-            )
-
-        else:
-
-            factor = (
-                Decimal(1)
-                + monthly_rate
-            ) ** n
-
-            emi = (
-                principal
-                * monthly_rate
-                * factor
-                / (factor - Decimal(1))
-            )
-
-        emi = emi.quantize(
-            Decimal("0.01"),
-            rounding=ROUND_HALF_UP
-        )
-
-        total = (
-            emi * n
-        ).quantize(
-            Decimal("0.01"),
-            rounding=ROUND_HALF_UP
-        )
-
-        obj.monthly_emi = emi
-        obj.total_payable = total
-        obj.total_interest = max(
-            total - principal,
-            Decimal("0")
-        )
-
-        obj.save()
-
-        messages.success(
-            request,
-            f"EMI created. Monthly EMI: ₹{emi:,.2f}"
-        )
-
-        return redirect(
-            "emi"
-        )
 
     emis = EMI.objects.filter(
         user=request.user
-    )
+    ).order_by("-id")
+
+    if request.method == "POST":
+
+        name = request.POST.get(
+            "name",
+            ""
+        ).strip()
+
+        amount = request.POST.get(
+            "amount"
+        )
+
+        due_date = request.POST.get(
+            "due_date"
+        )
+
+        if name and amount:
+
+            EMI.objects.create(
+                user=request.user,
+                name=name,
+                amount=amount,
+                due_date=due_date,
+            )
+
+            messages.success(
+                request,
+                "EMI added successfully."
+            )
+
+            return redirect("emi")
 
     return render(
         request,
         "emi.html",
         {
-            "form": form,
-            "emis": emis
+            "emis": emis,
         }
     )
 
 
 @login_required
 def emi_pay(request, pk):
+
     emi = get_object_or_404(
         EMI,
         pk=pk,
         user=request.user
     )
 
-    if (
-        request.method == "POST"
-        and emi.paid_installments
-        < emi.tenure_months
-    ):
+    if request.method == "POST":
 
-        seed_categories(
-            request.user
-        )
-
-        category = Category.objects.get(
-            owner=request.user,
-            name="Other"
-        )
-
-        Transaction.objects.create(
-            user=request.user,
-            title=f"EMI - {emi.loan_name}",
-            amount=emi.monthly_emi,
-            category=category,
-            transaction_type="expense",
-            payment_method="Bank",
-            date=timezone.localdate(),
-            note=(
-                f"EMI installment "
-                f"{emi.paid_installments + 1} "
-                f"of {emi.tenure_months}"
-            ),
-        )
-
-        emi.paid_installments += 1
-
-        emi.save(
-            update_fields=[
-                "paid_installments"
-            ]
-        )
+        emi.is_paid = True
+        emi.save()
 
         messages.success(
             request,
-            "EMI installment recorded "
-            "and added to Transactions."
+            "EMI marked as paid."
         )
 
-    return redirect(
-        "emi"
-    )
+    return redirect("emi")
 
 
 # =========================================================
@@ -1254,30 +848,36 @@ def profile(request):
         user=request.user
     )
 
-    form = ProfileForm(
-        request.POST or None,
-        request.FILES or None,
-        instance=profile_obj
-    )
+    if request.method == "POST":
 
-    if request.method == "POST" and form.is_valid():
+        request.user.first_name = request.POST.get(
+            "first_name",
+            ""
+        ).strip()
 
-        form.save()
+        request.user.last_name = request.POST.get(
+            "last_name",
+            ""
+        ).strip()
+
+        request.user.email = request.POST.get(
+            "email",
+            ""
+        ).strip()
+
+        request.user.save()
 
         messages.success(
             request,
             "Profile updated successfully."
         )
 
-        return redirect(
-            "profile"
-        )
+        return redirect("profile")
 
     return render(
         request,
         "profile.html",
         {
-            "form": form,
             "profile": profile_obj,
         }
     )
@@ -1287,47 +887,19 @@ def profile(request):
 # CONTACT
 # =========================================================
 
+@login_required
 def contact(request):
 
     if request.method == "POST":
 
-        data = {
-            k: request.POST.get(
-                k,
-                ""
-            ).strip()
-            for k in (
-                "name",
-                "email",
-                "subject",
-                "message",
-            )
-        }
+        messages.success(
+            request,
+            "Your message has been received."
+        )
 
-        if not all(data.values()):
-
-            messages.error(
-                request,
-                "Please fill in all fields."
-            )
-
-        else:
-
-            ContactMessage.objects.create(
-                **data
-            )
-
-            messages.success(
-                request,
-                "Your message has been sent successfully!"
-            )
-
-            return redirect(
-                "contact"
-            )
+        return redirect("contact")
 
     return render(
         request,
         "contact.html"
     )
-
